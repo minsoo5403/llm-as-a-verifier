@@ -2,15 +2,17 @@
  * OMP extension: LLM-as-a-Verifier.
  *
  * Three always-available tools (`verify_compare`, `verify_select`,
- * `verify_progress`) plus two opt-in automatic routes:
+ * `verify_progress`) plus three opt-in automatic routes:
  *
  *   gate     `session_stop` — score the finished turn; below `gate.min_score`
  *            the hook asks for a continuation instead of letting it settle.
  *   context  `tool_result`  — score progress after a configured tool and pass
  *            the number back as passive context while the task is incomplete.
+ *   proxy    `llm-verifier/verified` — generate N candidates with an upstream
+ *            model, rank them, replay the winner.
  *
- * Both automatic routes default to OFF (`/verifier gate on`), because each
- * turn they run spends real verifier tokens on the full trajectory.
+ * Every automatic route defaults to OFF (`/verifier gate on`), because each
+ * one spends real verifier tokens on the full trajectory.
  */
 
 import { existsSync } from "node:fs";
