@@ -27,6 +27,13 @@ import sys
 import traceback
 
 
+def _model_kwargs(params):
+    """Pass the configured verifier model through only when it is set, so the
+    library's own backend default survives."""
+    model = params.get("model")
+    return {"model": model} if model else {}
+
+
 def _dispatch(req, lv):
     command = req.get("command")
     p = req.get("params") or {}
@@ -55,6 +62,7 @@ def _dispatch(req, lv):
             p["problem"], p["candidate_a"], p["candidate_b"],
             criteria=p["criteria"],
             n_evaluations=int(p.get("n_evaluations", 1)),
+            **_model_kwargs(p),
         )
         return {"reward_a": r_a, "reward_b": r_b,
                 "prefers": "a" if r_a > r_b else ("b" if r_b > r_a else "tie")}
@@ -67,6 +75,7 @@ def _dispatch(req, lv):
             pivots=int(p.get("pivots", 2)),
             seed=int(p.get("seed", 0)),
             progress=False,
+            **_model_kwargs(p),
         )
         return {"index": res.index, "best": res.best, "scores": res.scores,
                 "n_comparisons": res.n_comparisons,
@@ -77,8 +86,9 @@ def _dispatch(req, lv):
             p["problem"], p["steps"],
             checkpoint_steps=p.get("checkpoint_steps"),
             n_evaluations=int(p.get("n_evaluations", 1)),
+            **_model_kwargs(p),
         )
-        return {"checkpoint_steps": res.checkpoint_steps, "scores": res.scores,
+        return {"checkpoint_steps": res.steps, "scores": res.scores,
                 "final": res.final}
 
     raise ValueError("unknown command: %r" % (command,))
@@ -102,6 +112,10 @@ def main() -> int:
         with open(args.request, encoding="utf8") as fh:
             req = json.load(fh)
         req.setdefault("root", root)
+        params = req.get("params") or {}
+        if params.get("effort"):
+            # deepseek_reasoning_params() reads this at call time.
+            os.environ["DEEPSEEK_EFFORT"] = str(params["effort"])
 
         from llm_verifier import fine_grained_reward as fgr
         fgr.load_dotenv(root)

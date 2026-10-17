@@ -1,6 +1,6 @@
 {
   "name": "@minsoo5403/llm-verifier-omp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "OMP extension that exposes LLM-as-a-Verifier (fine-grained logprob reward + Probabilistic Pivot Tournament) as always-available agent tools.",
   "license": "MIT",

@@ -1,128 +1,58 @@
 /**
- * OMP extension: LLM-as-a-Verifier tools.
+ * OMP extension: LLM-as-a-Verifier.
  *
- * Exposes the `llm_verifier` package (fine-grained logprob reward +
- * Probabilistic Pivot Tournament) to the agent as always-available tools.
- * The verifier itself runs in the repository's own Python environment; this
- * module only marshals one JSON request per tool call through
- * `python/omp_bridge.py`, so no verifier logic is duplicated in TypeScript.
+ * Three always-available tools (`verify_compare`, `verify_select`,
+ * `verify_progress`) plus two opt-in automatic routes:
  *
- * Environment:
- *   LLM_VERIFIER_ROOT    repository root (default: the plugin's parent dir)
- *   LLM_VERIFIER_PYTHON  interpreter to run the bridge with (default: the
- *                        repo's .venv, then python3/python on PATH)
+ *   gate     `session_stop` — score the finished turn; below `gate.min_score`
+ *            the hook asks for a continuation instead of letting it settle.
+ *   context  `tool_result`  — score progress after a configured tool and pass
+ *            the number back as passive context while the task is incomplete.
+ *
+ * Both automatic routes default to OFF (`/verifier gate on`), because each
+ * turn they run spends real verifier tokens on the full trajectory.
  */
 
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import { callBridge, findBridge, resolvePython, usageLine, type BridgeCallOptions } from "./bridge";
+import { DEFAULT_CONFIG, loadConfig, patchUserConfig, type VerifierConfig } from "./config";
+import { problemOf, stepsOf, textOfBlocks, truncateStep } from "./transcript";
+import { isProxyModel, registerProxyProvider } from "./proxy";
 
-const PLUGIN_DIR = (() => {
-  try {
-    return dirname(dirname(fileURLToPath(import.meta.url)));
-  } catch {
-    return dirname(process.cwd());
-  }
-})();
+const EFFORTS = ["off", "low", "high", "max"];
 
-function findBridge(): { bridge: string; repoRoot: string } {
-  const envRoot = process.env.LLM_VERIFIER_ROOT;
-  const candidates: Array<{ bridge: string; repoRoot: string }> = [];
-  if (envRoot) {
-    candidates.push({
-      bridge: join(envRoot, "omp-plugin", "python", "omp_bridge.py"),
-      repoRoot: envRoot,
-    });
-  }
-  candidates.push({
-    bridge: join(PLUGIN_DIR, "python", "omp_bridge.py"),
-    repoRoot: dirname(PLUGIN_DIR),
-  });
-  for (const c of candidates) if (existsSync(c.bridge)) return c;
-  return candidates[candidates.length - 1];
+function bridgeOptions(config: VerifierConfig): BridgeCallOptions {
+  return { model: config.verifier.model, effort: config.verifier.effort };
 }
 
-function resolvePython(repoRoot: string): string {
-  const fromEnv = process.env.LLM_VERIFIER_PYTHON;
-  if (fromEnv) return fromEnv;
-  const candidates =
-    process.platform === "win32"
-      ? [join(repoRoot, ".venv", "Scripts", "python.exe")]
-      : [join(repoRoot, ".venv", "bin", "python3"), join(repoRoot, ".venv", "bin", "python")];
-  for (const c of candidates) if (existsSync(c)) return c;
-  return process.platform === "win32" ? "python" : "python3";
-}
-
-type BridgeResponse = {
-  ok: boolean;
-  result?: Record<string, unknown>;
-  usage?: Record<string, number>;
-  error?: string;
-  traceback?: string;
-};
-
-function parseJson(text: string): BridgeResponse {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) {
-    throw new Error("bridge produced no JSON: " + text.slice(0, 400));
-  }
-  return JSON.parse(text.slice(start, end + 1)) as BridgeResponse;
-}
-
-async function callBridge(
-  pi: ExtensionAPI,
-  command: string,
-  params: Record<string, unknown>,
-  signal?: AbortSignal,
-): Promise<BridgeResponse> {
-  const { bridge, repoRoot } = findBridge();
-  if (!existsSync(bridge)) {
-    throw new Error(
-      `omp_bridge.py not found at ${bridge}. Set LLM_VERIFIER_ROOT to the ` +
-        `llm-as-a-verifier checkout.`,
-    );
-  }
-  const python = resolvePython(repoRoot);
-  const dir = mkdtempSync(join(tmpdir(), "llmver-"));
-  const reqPath = join(dir, "request.json");
-  try {
-    writeFileSync(reqPath, JSON.stringify({ command, params }), "utf8");
-    const res = await pi.exec(python, [bridge, reqPath, "--root", repoRoot], {
-      signal,
-      cwd: repoRoot,
-    });
-    if (res.killed) throw new Error("verifier call cancelled");
-    let payload: BridgeResponse;
-    try {
-      payload = parseJson(res.stdout ?? "");
-    } catch (err) {
-      throw new Error(
-        `${err instanceof Error ? err.message : String(err)}\n` +
-          `stderr: ${(res.stderr ?? "").slice(0, 600)}`,
-      );
-    }
-    if (!payload.ok) {
-      throw new Error(payload.error ?? "verifier bridge failed");
-    }
-    return payload;
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-function usageLine(usage?: Record<string, number>): string {
-  if (!usage) return "";
-  const hit = usage.cache_hit_rate ? ` cache ${(usage.cache_hit_rate * 100).toFixed(0)}%` : "";
-  return `\nverifier calls ${usage.calls}, in ${usage.input_tokens}, out ${usage.output_tokens}${hit}`;
+function scoreOf(result: Record<string, unknown> | undefined): number {
+  const raw = result?.final ?? result?.score;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : Number.NaN;
 }
 
 export default function llmVerifierExtension(pi: ExtensionAPI) {
   const z = pi.zod;
+  const readConfig = () => loadConfig(pi.cwd).config;
+
+  let gateContinuations = 0;
+  let contextCalls = 0;
+  let taskText = "";
+  let stepLog: string[] = [];
+  let liveModel: unknown = undefined;
+  let resolveModelSpec: (spec: string) => unknown = () => undefined;
 
   pi.setLabel("LLM-as-a-Verifier");
+
+  if (readConfig().proxy.enabled) {
+    registerProxyProvider({
+      pi,
+      config: readConfig,
+      liveModel: () => liveModel,
+      resolveModelSpec: (spec) => resolveModelSpec(spec),
+      log: (message) => pi.logger.info(message),
+    });
+  }
 
   pi.on("session_start", async (_event, ctx) => {
     const { bridge } = findBridge();
@@ -134,16 +64,234 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.registerCommand("verifier", {
-    description: "Report the llm-verifier bridge status and backend",
-    handler: async (_args, ctx) => {
-      const payload = await callBridge(pi, "ping", {});
-      const r = payload.result ?? {};
-      ctx.ui.notify(
-        `llm-verifier ${r.version} | python ${r.python} | backend ${r.backend} | ` +
-          `granularity ${r.granularity} | effort ${r.effort}`,
-        "info",
+  // A fresh user prompt starts a new task: reset the per-task route budgets.
+  pi.on("before_agent_start", async (event) => {
+    gateContinuations = 0;
+    contextCalls = 0;
+    stepLog = [];
+    if ("prompt" in event && typeof event.prompt === "string") taskText = event.prompt;
+  });
+
+  pi.on("turn_start", async (_event, ctx) => {
+    contextCalls = 0;
+    if ("models" in ctx) {
+      resolveModelSpec = (spec) => ctx.models.resolve(spec);
+      const current = ctx.models.current();
+      if (current && !isProxyModel(current)) liveModel = current;
+    }
+  });
+
+  pi.on("tool_result", async (event) => {
+    const toolName = "toolName" in event && typeof event.toolName === "string" ? event.toolName : "";
+    const output = "content" in event ? textOfBlocks(event.content) : "";
+    const input = "input" in event ? JSON.stringify(event.input ?? {}) : "{}";
+    stepLog.push(truncateStep(`tool ${toolName} ${truncateStep(input, 600)}\n-> ${output}`));
+
+    const config = readConfig();
+    if (!config.context.enabled) return;
+    if (!config.context.tools.includes(toolName)) return;
+    if (output.length < config.context.min_output_chars) return;
+    if (contextCalls >= config.context.max_calls_per_turn) return;
+    if (!taskText || stepLog.length === 0) return;
+
+    contextCalls += 1;
+    try {
+      const payload = await callBridge(
+        pi,
+        "track",
+        {
+          problem: taskText,
+          steps: stepLog,
+          checkpoint_steps: [stepLog.length],
+          n_evaluations: config.context.n_evaluations,
+        },
+        bridgeOptions(config),
       );
+      const score = scoreOf(payload.result);
+      if (!Number.isFinite(score) || score >= config.context.min_score) {
+        pi.logger.info(`llm-verifier: progress ok score=${score}`);
+        return;
+      }
+      pi.logger.info(
+        `llm-verifier: progress injected score=${score} tool=${toolName} step=${stepLog.length}`,
+      );
+      return {
+        additionalContext:
+          `<verifier-progress score="${score.toFixed(3)}" bar="${config.context.min_score}">` +
+          `A logprob verifier scored the current state ${score.toFixed(3)} of 1 against the task, ` +
+          `below the completion bar. Trust observed output over narration: check what is still ` +
+          `missing before continuing.</verifier-progress>`,
+      };
+    } catch (err) {
+      pi.logger.warn(
+        `llm-verifier: progress check failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  });
+
+  pi.on("session_stop", async (event) => {
+    const config = readConfig();
+    if (!config.gate.enabled) return;
+    if ("stop_hook_active" in event && event.stop_hook_active === true) return;
+    if (gateContinuations >= config.gate.max_continuations) return;
+
+    const messages = "messages" in event ? event.messages : undefined;
+    const problem = problemOf(messages) || taskText;
+    const steps = stepsOf(messages);
+    if (!problem || steps.length === 0) return;
+
+    let score: number;
+    try {
+      const payload = await callBridge(
+        pi,
+        "track",
+        {
+          problem,
+          steps,
+          checkpoint_steps: [steps.length],
+          n_evaluations: config.gate.n_evaluations,
+        },
+        bridgeOptions(config),
+      );
+      score = scoreOf(payload.result);
+    } catch (err) {
+      pi.logger.warn(
+        `llm-verifier: gate check failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+    if (!Number.isFinite(score) || score >= config.gate.min_score) {
+      pi.logger.info(`llm-verifier: gate passed score=${score}`);
+      return;
+    }
+
+    gateContinuations += 1;
+    pi.logger.info(
+      `llm-verifier: gate fired score=${score} bar=${config.gate.min_score} ` +
+        `continuation=${gateContinuations}/${config.gate.max_continuations}`,
+    );
+    return {
+      continue: true,
+      additionalContext:
+        `<verifier-gate score="${score.toFixed(3)}" bar="${config.gate.min_score}" ` +
+        `attempt="${gateContinuations}/${config.gate.max_continuations}">` +
+        `The turn ended, but a logprob verifier scored the state ${score.toFixed(3)} of 1 ` +
+        `against the task — below the completion bar. Either finish the missing work, or ` +
+        `state plainly what remains and why it cannot be done.</verifier-gate>`,
+    };
+  });
+
+  pi.registerCommand("verifier", {
+    description:
+      "LLM-as-a-Verifier: status, gate on|off, context on|off, model <id>|default, effort <off|low|high|max>, score <0..1>, tools <a,b>, reset",
+    handler: async (args, ctx) => {
+      const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+      const value = rest[0] ?? "";
+      const truthy = value === "on" || value === "1" || value === "true";
+      const falsy = value === "off" || value === "0" || value === "false";
+      let wrote = "";
+
+      try {
+        switch (sub) {
+          case "status": {
+            const config = readConfig();
+            const { bridge, repoRoot } = findBridge();
+            const ping = await callBridge(pi, "ping", {});
+            const info = ping.result ?? {};
+            ctx.ui.notify(
+              [
+                `bridge      ${existsSync(bridge) ? "ok" : "MISSING"} ${bridge}`,
+                `python      ${resolvePython(repoRoot)}`,
+                `backend     ${String(info.backend)}  (llm-verifier ${String(info.version)})`,
+                `model       ${config.verifier.model ?? "backend default"}`,
+                `effort      ${config.verifier.effort}`,
+                `gate        ${config.gate.enabled ? "ON" : "off"}  bar ${config.gate.min_score}, max ${config.gate.max_continuations} continuations`,
+                `context     ${config.context.enabled ? "ON" : "off"}  tools ${config.context.tools.join(",")}, bar ${config.context.min_score}, max ${config.context.max_calls_per_turn}/turn`,
+                `proxy       ${config.proxy.enabled ? "ON" : "off"}  upstream ${config.proxy.upstream ?? "(session model)"}, candidates ${config.proxy.candidates}`,
+                `config      ${loadConfig(pi.cwd).userPath}`,
+              ].join("\n"),
+              "info",
+            );
+            return;
+          }
+          case "gate":
+          case "context":
+          case "proxy": {
+            if (!truthy && !falsy) {
+              ctx.ui.notify(`usage: /verifier ${sub} on|off`, "warning");
+              return;
+            }
+            wrote = patchUserConfig(pi.cwd, { [sub]: { enabled: truthy } });
+            break;
+          }
+          case "model": {
+            if (!value) {
+              ctx.ui.notify("usage: /verifier model <verifier-model-id>|default", "warning");
+              return;
+            }
+            wrote = patchUserConfig(pi.cwd, {
+              verifier: { model: value === "default" ? null : value },
+            });
+            break;
+          }
+          case "effort": {
+            if (!EFFORTS.includes(value)) {
+              ctx.ui.notify(`usage: /verifier effort ${EFFORTS.join("|")}`, "warning");
+              return;
+            }
+            wrote = patchUserConfig(pi.cwd, { verifier: { effort: value } });
+            break;
+          }
+          case "score": {
+            const parsed = Number(value);
+            if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+              ctx.ui.notify("usage: /verifier score <0..1>", "warning");
+              return;
+            }
+            wrote = patchUserConfig(pi.cwd, {
+              gate: { min_score: parsed },
+              context: { min_score: parsed },
+            });
+            break;
+          }
+          case "upstream": {
+            if (!value || !value.includes("/")) {
+              ctx.ui.notify("usage: /verifier upstream <provider>/<model>", "warning");
+              return;
+            }
+            wrote = patchUserConfig(pi.cwd, { proxy: { upstream: value } });
+            break;
+          }
+          case "tools": {
+            const tools = rest.join(",").split(",").map((t) => t.trim()).filter(Boolean);
+            if (tools.length === 0) {
+              ctx.ui.notify("usage: /verifier tools bash,eval", "warning");
+              return;
+            }
+            wrote = patchUserConfig(pi.cwd, { context: { tools } });
+            break;
+          }
+          case "reset": {
+            wrote = patchUserConfig(pi.cwd, {
+              verifier: { ...DEFAULT_CONFIG.verifier },
+              gate: { ...DEFAULT_CONFIG.gate },
+              context: { ...DEFAULT_CONFIG.context },
+              proxy: { ...DEFAULT_CONFIG.proxy },
+            });
+            break;
+          }
+          default: {
+            ctx.ui.notify(`unknown subcommand: ${sub}`, "warning");
+            return;
+          }
+        }
+        ctx.ui.notify(`llm-verifier: ${sub} updated in ${wrote}`, "info");
+      } catch (err) {
+        ctx.ui.notify(
+          `llm-verifier: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
+      }
     },
   });
 
@@ -165,6 +313,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
       n_evaluations: z.number().optional(),
     }),
     async execute(_id, params, signal) {
+      const config = readConfig();
       const payload = await callBridge(
         pi,
         "compare",
@@ -175,7 +324,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
           criteria: params.criteria,
           n_evaluations: params.n_evaluations ?? 1,
         },
-        signal,
+        { ...bridgeOptions(config), signal },
       );
       const r = payload.result as { reward_a: number; reward_b: number; prefers: string };
       return {
@@ -214,6 +363,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
       if (params.candidates.length < 2) {
         throw new Error("verify_select needs at least 2 candidates");
       }
+      const config = readConfig();
       const payload = await callBridge(
         pi,
         "select",
@@ -225,7 +375,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
           n_evaluations: params.n_evaluations ?? 1,
           seed: params.seed ?? 0,
         },
-        signal,
+        { ...bridgeOptions(config), signal },
       );
       const r = payload.result as {
         index: number;
@@ -257,7 +407,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
     defaultInactive: false,
     description:
       "Score how far a finished trajectory got after each step, from the " +
-      "verifier's logprob expectation (1 = certainly incomplete, 20 = verified " +
+      "verifier's logprob expectation (0 = certainly incomplete, 1 = verified " +
       "complete). Use it to find the step where a run stopped making progress.",
     parameters: z.object({
       problem: z.string(),
@@ -265,6 +415,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
       n_evaluations: z.number().optional(),
     }),
     async execute(_id, params, signal) {
+      const config = readConfig();
       const payload = await callBridge(
         pi,
         "track",
@@ -273,7 +424,7 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
           steps: params.steps,
           n_evaluations: params.n_evaluations ?? 1,
         },
-        signal,
+        { ...bridgeOptions(config), signal },
       );
       const r = payload.result as {
         checkpoint_steps: number[];
@@ -285,7 +436,10 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
         .join("\n");
       return {
         content: [
-          { type: "text", text: `progress (final ${r.final.toFixed(4)})\n${curve}${usageLine(payload.usage)}` },
+          {
+            type: "text",
+            text: `progress (final ${r.final.toFixed(4)})\n${curve}${usageLine(payload.usage)}`,
+          },
         ],
         details: { ...r, usage: payload.usage },
       };
