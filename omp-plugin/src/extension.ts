@@ -16,11 +16,10 @@
 import { existsSync } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { callBridge, findBridge, resolvePython, usageLine, type BridgeCallOptions } from "./bridge";
-import { DEFAULT_CONFIG, loadConfig, patchUserConfig, type VerifierConfig } from "./config";
+import { loadConfig, type VerifierConfig } from "./config";
 import { problemOf, stepsOf, textOfBlocks, truncateStep } from "./transcript";
 import { isProxyModel, registerProxyProvider } from "./proxy";
-
-const EFFORTS = ["off", "low", "high", "max"];
+import { runVerifierCommand } from "./command";
 
 function bridgeOptions(config: VerifierConfig): BridgeCallOptions {
   return { model: config.verifier.model, effort: config.verifier.effort };
@@ -183,115 +182,23 @@ export default function llmVerifierExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("verifier", {
     description:
-      "LLM-as-a-Verifier: status, gate on|off, context on|off, model <id>|default, effort <off|low|high|max>, score <0..1>, tools <a,b>, reset",
+      "LLM-as-a-Verifier: status, gate|context|proxy on|off, model <id>|default, " +
+      "upstream <provider>/<model>, effort <off|low|high|max>, score <0..1>, tools <a,b>, reset",
     handler: async (args, ctx) => {
-      const [sub = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
-      const value = rest[0] ?? "";
-      const truthy = value === "on" || value === "1" || value === "true";
-      const falsy = value === "off" || value === "0" || value === "false";
-      let wrote = "";
-
-      try {
-        switch (sub) {
-          case "status": {
-            const config = readConfig();
-            const { bridge, repoRoot } = findBridge();
-            const ping = await callBridge(pi, "ping", {});
-            const info = ping.result ?? {};
-            ctx.ui.notify(
-              [
-                `bridge      ${existsSync(bridge) ? "ok" : "MISSING"} ${bridge}`,
-                `python      ${resolvePython(repoRoot)}`,
-                `backend     ${String(info.backend)}  (llm-verifier ${String(info.version)})`,
-                `model       ${config.verifier.model ?? "backend default"}`,
-                `effort      ${config.verifier.effort}`,
-                `gate        ${config.gate.enabled ? "ON" : "off"}  bar ${config.gate.min_score}, max ${config.gate.max_continuations} continuations`,
-                `context     ${config.context.enabled ? "ON" : "off"}  tools ${config.context.tools.join(",")}, bar ${config.context.min_score}, max ${config.context.max_calls_per_turn}/turn`,
-                `proxy       ${config.proxy.enabled ? "ON" : "off"}  upstream ${config.proxy.upstream ?? "(session model)"}, candidates ${config.proxy.candidates}`,
-                `config      ${loadConfig(pi.cwd).userPath}`,
-              ].join("\n"),
-              "info",
-            );
-            return;
-          }
-          case "gate":
-          case "context":
-          case "proxy": {
-            if (!truthy && !falsy) {
-              ctx.ui.notify(`usage: /verifier ${sub} on|off`, "warning");
-              return;
-            }
-            wrote = patchUserConfig(pi.cwd, { [sub]: { enabled: truthy } });
-            break;
-          }
-          case "model": {
-            if (!value) {
-              ctx.ui.notify("usage: /verifier model <verifier-model-id>|default", "warning");
-              return;
-            }
-            wrote = patchUserConfig(pi.cwd, {
-              verifier: { model: value === "default" ? null : value },
-            });
-            break;
-          }
-          case "effort": {
-            if (!EFFORTS.includes(value)) {
-              ctx.ui.notify(`usage: /verifier effort ${EFFORTS.join("|")}`, "warning");
-              return;
-            }
-            wrote = patchUserConfig(pi.cwd, { verifier: { effort: value } });
-            break;
-          }
-          case "score": {
-            const parsed = Number(value);
-            if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-              ctx.ui.notify("usage: /verifier score <0..1>", "warning");
-              return;
-            }
-            wrote = patchUserConfig(pi.cwd, {
-              gate: { min_score: parsed },
-              context: { min_score: parsed },
-            });
-            break;
-          }
-          case "upstream": {
-            if (!value || !value.includes("/")) {
-              ctx.ui.notify("usage: /verifier upstream <provider>/<model>", "warning");
-              return;
-            }
-            wrote = patchUserConfig(pi.cwd, { proxy: { upstream: value } });
-            break;
-          }
-          case "tools": {
-            const tools = rest.join(",").split(",").map((t) => t.trim()).filter(Boolean);
-            if (tools.length === 0) {
-              ctx.ui.notify("usage: /verifier tools bash,eval", "warning");
-              return;
-            }
-            wrote = patchUserConfig(pi.cwd, { context: { tools } });
-            break;
-          }
-          case "reset": {
-            wrote = patchUserConfig(pi.cwd, {
-              verifier: { ...DEFAULT_CONFIG.verifier },
-              gate: { ...DEFAULT_CONFIG.gate },
-              context: { ...DEFAULT_CONFIG.context },
-              proxy: { ...DEFAULT_CONFIG.proxy },
-            });
-            break;
-          }
-          default: {
-            ctx.ui.notify(`unknown subcommand: ${sub}`, "warning");
-            return;
-          }
-        }
-        ctx.ui.notify(`llm-verifier: ${sub} updated in ${wrote}`, "info");
-      } catch (err) {
-        ctx.ui.notify(
-          `llm-verifier: ${err instanceof Error ? err.message : String(err)}`,
-          "error",
-        );
-      }
+      await runVerifierCommand(args, {
+        cwd: pi.cwd,
+        notify: (message, level) => ctx.ui.notify(message, level),
+        bridgeStatus: async () => {
+          const { bridge, repoRoot } = findBridge();
+          const ping = await callBridge(pi, "ping", {});
+          const info = ping.result ?? {};
+          return [
+            `bridge      ${existsSync(bridge) ? "ok" : "MISSING"} ${bridge}`,
+            `python      ${resolvePython(repoRoot)}`,
+            `backend     ${String(info.backend)}  (llm-verifier ${String(info.version)})`,
+          ];
+        },
+      });
     },
   });
 

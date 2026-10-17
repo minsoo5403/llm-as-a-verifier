@@ -200,14 +200,14 @@ export function loadConfig(cwd: string): { config: VerifierConfig; userPath: str
 
 /** Patch the user-level config file, preserving keys this plugin does not own. */
 export function patchUserConfig(cwd: string, patch: Record<string, unknown>): string {
-  const { userPath } = configPaths(cwd);
-  const existing = asRecord(readLayer(userPath));
+  const { user } = configPaths(cwd);
+  const existing = asRecord(readLayer(user));
   const merged: Record<string, unknown> = { ...existing };
   for (const [section, values] of Object.entries(patch)) {
     if (values === undefined) continue;
     merged[section] = { ...asRecord(existing[section]), ...asRecord(values) };
   }
-  mkdirSync(dirname(userPath), { recursive: true });
-  writeFileSync(userPath, JSON.stringify(merged, null, 2) + "\n", "utf8");
-  return userPath;
+  mkdirSync(dirname(user), { recursive: true });
+  writeFileSync(user, JSON.stringify(merged, null, 2) + "\n", "utf8");
+  return user;
 }
